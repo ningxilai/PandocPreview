@@ -65,13 +65,21 @@ async function handleMessage(data: string) {
         break
       }
       case "stop": {
-        if (watcher) { watcher.close(); watcher = null }
-        try { await Deno.remove(sessionDir, { recursive: true }) } catch {}
+        await cleanup()
         break
       }
     }
   } catch {}
 }
+
+async function cleanup() {
+  if (watcher) { watcher.close(); watcher = null }
+  try { await Deno.remove(sessionDir, { recursive: true }) } catch {}
+}
+
+try { Deno.addSignalListener("SIGINT", async () => { await cleanup(); Deno.exit(0) }) } catch {}
+try { Deno.addSignalListener("SIGTERM", async () => { await cleanup(); Deno.exit(0) }) } catch {}
+try { Deno.addSignalListener("SIGHUP", async () => { await cleanup(); Deno.exit(0) }) } catch {}
 
 async function runCmd(exe: string, args: string[], cwd: string) {
   const { success, stderr } = await new Deno.Command(exe, {
@@ -81,12 +89,12 @@ async function runCmd(exe: string, args: string[], cwd: string) {
 }
 
 async function doRender() {
-  if (renderArgs.length === 0) return
+  if (!Array.isArray(renderArgs) || renderArgs.length === 0) return
   rendering = true
   renderPending = false
   try {
     for (const args of renderArgs) {
-      if (args.length === 0) continue
+      if (!Array.isArray(args) || args.length === 0) continue
       const { success, stderr } = await runCmd(args[0], args.slice(1), tempDir)
       if (!success) {
         sendToEmacs({ type: "render-error", message: stderr.split("\n").pop() || stderr })

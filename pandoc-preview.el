@@ -273,6 +273,8 @@ Returns a list of lists, each inner list is (EXE ARG...)."
   (setq pandoc-preview--active nil)
   (setq pandoc-preview--active-buffers (delq (current-buffer) pandoc-preview--active-buffers))
   (when (and (null pandoc-preview--active-buffers) pandoc-preview--deno-process)
+    (pandoc-preview--send '("stop"))
+    (sleep-for 0.3)
     (ignore-errors (delete-process pandoc-preview--deno-process))
     (let ((buf (get-buffer " *pandoc-preview-deno*")))
       (when buf (kill-buffer buf)))
