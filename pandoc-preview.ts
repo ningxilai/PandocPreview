@@ -1,75 +1,66 @@
-import { join, basename, extname } from "https://deno.land/std/path/mod.ts"
+import { join, basename } from "https://deno.land/std/path/mod.ts"
 import { ensureDir, ensureSymlink } from "https://deno.land/std/fs/mod.ts"
 
-const denoPort = parseInt(Deno.args[1])
-const emacsPort = parseInt(Deno.args[2])
-
+const emacsPort = parseInt(Deno.args[1])
 const globalTmp = "/dev/shm"
 const sessionDir = join(globalTmp, `preview-${Deno.pid}`)
 
-const server = Deno.serve({ port: denoPort, hostname: "127.0.0.1" }, (req) => {
-  if (req.headers.get("upgrade") !== "websocket") return new Response("no", { status: 400 })
-  const { socket, response } = Deno.upgradeWebSocket(req)
-  emacsSocket = socket
-  socket.onmessage = (e) => {
-    if (typeof e.data === "string") messageDispatcher(e.data)
-  }
-  return response
-})
-
-let emacsSocket: WebSocket | null = null
-let toEmacsWs: WebSocket | null = null
-
+let emacsWs: WebSocket | null = null
 let tempDir = ""
 let rootDir = ""
 let filePath = ""
-let backend = ""
-let httpPort = 0
+let renderArgs: string[][] = []
+let watchRx: RegExp | null = null
 let renderTimer: number | null = null
 let rendering = false
 let renderPending = false
 let renderVersion = 0
 let watcher: Deno.FsWatcher | null = null
 
-function evalInEmacs(code: string) {
-  if (toEmacsWs && toEmacsWs.readyState === WebSocket.OPEN) {
-    toEmacsWs.send(JSON.stringify({ type: "eval-code", content: code }))
+function sendToEmacs(msg: Record<string, unknown>) {
+  if (emacsWs && emacsWs.readyState === WebSocket.OPEN) {
+    emacsWs.send(JSON.stringify(msg))
   }
 }
 
-toEmacsWs = new WebSocket(`ws://127.0.0.1:${emacsPort}`)
-toEmacsWs.onerror = () => {}
-toEmacsWs.onclose = () => {}
+emacsWs = new WebSocket(`ws://127.0.0.1:${emacsPort}`)
+emacsWs.onerror = () => {}
+emacsWs.onclose = () => {}
+emacsWs.onmessage = (e) => {
+  if (typeof e.data === "string") handleMessage(e.data)
+}
 
-async function messageDispatcher(message: string) {
+async function handleMessage(data: string) {
   try {
-    const parsed = JSON.parse(message)
-    const [cmd, ...args] = parsed[1]
-
+    const [cmd, ...args] = JSON.parse(data)
     switch (cmd) {
-      case "start": {
+      case "init": {
         rootDir = args[0]
         filePath = args[1]
-        backend = args[2]
         const hash = Array.from(
           new Uint8Array(await crypto.subtle.digest("SHA-1", new TextEncoder().encode(rootDir)))
         ).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 12)
         tempDir = join(sessionDir, hash)
         await ensureDir(tempDir)
-        await symlinkProject()
-        try { await Deno.remove(join(tempDir, "compiled"), { recursive: true }) } catch {}
+        for await (const entry of Deno.readDir(rootDir)) {
+          if (entry.name.startsWith(".")) continue
+          try { await ensureSymlink(join(rootDir, entry.name), join(tempDir, entry.name)) } catch {}
+        }
+        break
+      }
+      case "render": {
+        renderArgs = args[0]
+        watchRx = new RegExp(args[1])
         await doRender()
         startWatcher()
-        await startHttpServer()
+        const server = Deno.serve({ port: 0, hostname: "127.0.0.1" }, httpHandler)
+        sendToEmacs({ type: "server-ready", port: server.addr.port })
         break
       }
       case "sync": {
-        const path: string = args[0]
-        const content: string = args[1]
-        const name = basename(path)
-        const target = join(tempDir, name)
-        try { await Deno.remove(target) } catch {}
-        await Deno.writeTextFile(target, content)
+        const name = basename(args[0])
+        try { await Deno.remove(join(tempDir, name)) } catch {}
+        await Deno.writeTextFile(join(tempDir, name), args[1])
         scheduleRender()
         break
       }
@@ -82,78 +73,53 @@ async function messageDispatcher(message: string) {
   } catch {}
 }
 
-async function symlinkProject() {
-  for await (const entry of Deno.readDir(rootDir)) {
-    if (entry.name.startsWith(".")) continue
-    try {
-      await ensureSymlink(join(rootDir, entry.name), join(tempDir, entry.name))
-    } catch {}
-  }
-}
-
-function scheduleRender() {
-  if (renderTimer !== null) clearTimeout(renderTimer)
-  renderTimer = setTimeout(() => {
-    if (rendering) { renderPending = true } else { doRender() }
-  }, 300)
+async function runCmd(exe: string, args: string[], cwd: string) {
+  const { success, stderr } = await new Deno.Command(exe, {
+    args, cwd, stdout: "piped", stderr: "piped"
+  }).output()
+  return { success, stderr: new TextDecoder().decode(stderr).trim() }
 }
 
 async function doRender() {
+  if (renderArgs.length === 0) return
   rendering = true
   renderPending = false
   try {
-    const name = basename(filePath)
-    let cmd: Deno.Command
-
-    if (backend === "pollen") {
-      try { await Deno.remove(join(tempDir, "compiled"), { recursive: true }) } catch {}
-      cmd = new Deno.Command("raco", {
-        args: ["pollen", "render"],
-        cwd: tempDir, stdout: "piped", stderr: "piped",
-      })
-    } else if (backend.startsWith("pandoc-")) {
-      const fmt = backend.slice(7)
-      const outName = name.replace(/\.\w+$/, ".html")
-      cmd = new Deno.Command("pandoc", {
-        args: [name, "-f", fmt, "-t", "html5", "--standalone",
-               "--mathjax", "--highlight-style=tango",
-               "-o", outName],
-        cwd: tempDir, stdout: "piped", stderr: "piped",
-      })
-    } else if (backend === "typst") {
-      const outName = name.replace(/\.\w+$/, ".html")
-      cmd = new Deno.Command("typst", {
-        args: ["compile", name, outName],
-        cwd: tempDir, stdout: "piped", stderr: "piped",
-      })
-    } else {
-      return
+    for (const args of renderArgs) {
+      if (args.length === 0) continue
+      const { success, stderr } = await runCmd(args[0], args.slice(1), tempDir)
+      if (!success) {
+        sendToEmacs({ type: "render-error", message: stderr.split("\n").pop() || stderr })
+        rendering = false
+        return
+      }
     }
-
-    const { success, stderr } = await cmd.output()
-    if (!success) {
-      const err = new TextDecoder().decode(stderr).trim()
-      evalInEmacs(`(message "[preview] %s" ${JSON.stringify(err.split("\n").pop())})`)
-    } else {
-      renderVersion++
-      await Deno.writeTextFile(join(tempDir, ".render-version"), String(renderVersion))
-    }
+    renderVersion++
+    await Deno.writeTextFile(join(tempDir, ".render-version"), String(renderVersion))
   } catch {}
   rendering = false
   if (renderPending) doRender()
 }
 
-const watchRx = /\.(pm|pmd|pp|ptree|rkt|md|markdown|org|rst|tex|latex|adoc|asciidoc|typ)$/
+function scheduleRender() {
+  if (renderTimer !== null) clearTimeout(renderTimer)
+  renderTimer = setTimeout(() => {
+    if (rendering) renderPending = true
+    else doRender()
+  }, 300)
+}
 
 function startWatcher() {
+  if (!watchRx) return
+  const rx = watchRx
   try {
     watcher = Deno.watchFs(rootDir)
     ;(async () => {
       for await (const event of watcher!) {
         if (event.kind === "modify" || event.kind === "create") {
-          if (event.paths.some((p) => watchRx.test(p) && !p.includes("/."))) {
+          if (event.paths.some(p => rx.test(p) && !p.includes("/."))) {
             for (const p of event.paths) {
-              if (watchRx.test(p) && !p.includes("/.")) {
+              if (rx.test(p) && !p.includes("/.")) {
                 try {
                   const content = await Deno.readTextFile(p)
                   const target = join(tempDir, basename(p))
@@ -170,62 +136,22 @@ function startWatcher() {
   } catch {}
 }
 
-async function startHttpServer() {
-  const httpServer = Deno.serve({ port: 0, hostname: "127.0.0.1" }, handler)
-  httpPort = httpServer.addr.port
-  evalInEmacs(`(pandoc-preview--server-ready ${httpPort})`)
-}
+const RELOAD = `<script>(function(){var v=0;function c(){fetch("/__pv?="+Date.now()).then(function(r){return r.text()}).then(function(t){var n=+t;if(!v){v=n}if(n>v){location.reload()}}).catch(function(){})}setInterval(c,200)})()</script>`
 
-const RELOAD_SCRIPT = `<script>
-(function(){
-  var v=0;
-  function check(){
-    fetch('/__preview_version?_='+Date.now())
-      .then(function(r){return r.text()})
-      .then(function(t){
-        var n=parseInt(t);
-        if(v===0){v=n;return}
-        if(n>v){location.reload()}
-      }).catch(function(){});
-  }
-  setInterval(check,200);
-})();
-</script>`
-
-async function handler(req: Request): Promise<Response> {
-  const url = new URL(req.url)
-  const path = url.pathname
-
-  if (path === "/__preview_version") {
-    return new Response(String(renderVersion), {
-      headers: { "Cache-Control": "no-cache" },
-    })
-  }
-
+async function httpHandler(req: Request): Promise<Response> {
+  const path = new URL(req.url).pathname
+  if (path === "/__pv") return new Response(String(renderVersion), { headers: { "Cache-Control": "no-cache" } })
   const base = basename(filePath).replace(/\.\w+$/, "")
-  const candidates = path === "/"
-    ? [`${base}.html`, base, "index.html", "index"]
-    : path.endsWith(".html")
-      ? [path, path.slice(0, -5)]
-      : [path, path + ".html"]
-
-  for (const c of candidates) {
-    const fp = join(tempDir, c)
+  const cands = path === "/" ? [base + ".html", base, "index.html"] : [path, path + ".html", path.slice(0, -5)]
+  for (const c of cands) {
     try {
-      let content = await Deno.readTextFile(fp)
-      const isHtml = c.endsWith(".html") || !c.includes(".")
-      if (isHtml) {
-        content = content.replace(/<\/?root>/g, "")
-        content = content.replace("</head>", RELOAD_SCRIPT + "</head>")
+      let content = await Deno.readTextFile(join(tempDir, c))
+      if (c.endsWith(".html") || !c.includes(".")) {
+        content = content.replace(/<\/?root>/g, "").replace("</head>", RELOAD + "</head>")
       }
       const ext = (c.split(".").pop() || "").toLowerCase()
-      const ct: Record<string, string> = {
-        html: "text/html", css: "text/css", js: "text/javascript",
-        png: "image/png", jpg: "image/jpeg", svg: "image/svg+xml",
-      }
-      return new Response(content, {
-        headers: { "Content-Type": ct[ext] || "text/html; charset=utf-8" },
-      })
+      const ct: Record<string, string> = { html: "text/html", css: "text/css", js: "text/javascript", png: "image/png", jpg: "image/jpeg", svg: "image/svg+xml" }
+      return new Response(content, { headers: { "Content-Type": ct[ext] || "text/html; charset=utf-8" } })
     } catch {}
   }
   return new Response("Not found", { status: 404 })
