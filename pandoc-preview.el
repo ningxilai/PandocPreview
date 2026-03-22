@@ -17,7 +17,10 @@
 
 ;;; Code:
 
-(require 'deno-bridge)
+;; Suppress warnings from deno-bridge
+(defvar emacs-conductor-enable-debug)
+(with-no-warnings
+  (load "deno-bridge" nil t))
 (require 'json)
 (require 'cl-lib)
 (require 'project)
@@ -85,16 +88,18 @@
 
 PLIST keys:
   :commands - List of command specs.  Each spec is a list of strings.
-              \"{in}\" is replaced with the input filename (basename).
-              \"{out}\" is replaced with the output filename (basename with .html).
+              \\\"{in}\\\" is replaced with input filename (basename).
+              \\\"{out}\\\" is replaced with output filename (.html).
   :watch    - Regexp string for file watcher to monitor.
 
-To add a new backend, just add an entry here.  No TypeScript changes needed.
+To add a new backend, just add an entry here.
+No TypeScript changes needed.
 
 Example custom backend:
 
-  (\"\\\\.custom\\\\'\" :commands ((\"my-tool\" \"--render\" \"{in}\" \"-o\" \"{out}\"))
-                       :watch \"\\\\.custom$\")"
+  (\\\"\\\\\\\\.custom\\\\\\\\'\\\" :commands
+   ((\\\"my-tool\\\" \\\"--render\\\" \\\"{in}\\\" \\\"-o\\\" \\\"{out}\\\"))
+   :watch \\\"\\\\\\\\.custom$\\\")"
   :type '(alist :key-type string :value-type plist)
   :group 'pandoc-preview)
 
@@ -315,3 +320,7 @@ Returns a list of lists, each inner list is (EXE ARG...)."
 
 (provide 'pandoc-preview)
 ;;; pandoc-preview.el ends here
+
+;; Local Variables:
+;; byte-compile-warnings: (not free-vars unresolved lexical noruntime)
+;; End:
