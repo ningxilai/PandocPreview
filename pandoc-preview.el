@@ -234,6 +234,9 @@ Returns a list of lists, each inner list is (EXE ARG...)."
 
         (pandoc-preview--wait-for-connection 10)
 
+        (message "[pandoc-preview] debug: backend-plist=%S commands=%S watch-rx=%S"
+                 backend-plist commands watch-rx)
+
         (deno-bridge-call "pandoc-preview" "init"
                           pandoc-preview--root file-abs backend-name)
 

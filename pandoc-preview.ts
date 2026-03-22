@@ -62,9 +62,10 @@ async function messageDispatcher(message: string) {
         break
       }
       case "render": {
+        log(`render: args[0]=${args[0]}, args[1]=${args[1]}`)
         renderArgs = JSON.parse(args[0] as string) as string[][]
         watchRx = new RegExp(args[1] as string)
-        log(`render: cmd=${JSON.stringify(renderArgs[0])}`)
+        log(`render: renderArgs=${JSON.stringify(renderArgs)}`)
         await doRender()
         const files: string[] = []
         for await (const entry of Deno.readDir(tempDir)) {
@@ -213,6 +214,20 @@ async function httpHandler(req: Request): Promise<Response> {
     return new Response(String(renderVersion), {
       headers: { "Cache-Control": "no-cache" },
     })
+  if (path === "/__debug") {
+    const files: string[] = []
+    try {
+      for await (const entry of Deno.readDir(tempDir)) {
+        files.push(entry.name)
+      }
+    } catch (e) {
+      return new Response(`Error reading tempDir: ${(e as Error).message}`, { headers: { "Content-Type": "text/plain" } })
+    }
+    return new Response(
+      `tempDir: ${tempDir}\nfilePath: ${filePath}\nrootDir: ${rootDir}\nfiles: ${files.join(", ")}`,
+      { headers: { "Content-Type": "text/plain" } }
+    )
+  }
   const base = basename(filePath).replace(/\.\w+$/, "")
   const cands =
     path === "/"
