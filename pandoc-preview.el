@@ -1,7 +1,7 @@
 ;;; pandoc-preview.el --- Live preview for documents via browser -*- lexical-binding: t; -*-
 
-;; Version: 0.3
-;; Package-Requires: ((emacs "28.1") (websocket "1.15"))
+;; Version: 0.4
+;; Package-Requires: ((emacs "28.1") (deno-bridge "0.1"))
 ;; Keywords: preview, pandoc, pollen, markdown
 
 ;;; Commentary:
@@ -10,25 +10,21 @@
 ;; The TypeScript server is a generic render executor; all backend
 ;; logic (commands, arguments, watch patterns) is defined in Elisp.
 ;;
-;; Architecture: Emacs creates a websocket server, Deno connects as
-;; client.  All communication is bidirectional over this single channel.
+;; Architecture: deno-bridge manages Emacs<->Deno communication.
+;; Deno runs an HTTP server for browser preview and handles rendering.
 ;;
 ;; Usage: M-x pandoc-preview-start / pandoc-preview-stop
 
 ;;; Code:
 
-(require 'websocket)
+(require 'deno-bridge)
 (require 'json)
 (require 'cl-lib)
 (require 'project)
 
 (defvar pandoc-preview--ts-path nil)
-
-(defvar pandoc-preview--port nil)
 (defvar pandoc-preview--root nil)
-(defvar pandoc-preview--server nil)
-(defvar pandoc-preview--ws nil)
-(defvar pandoc-preview--deno-process nil)
+(defvar pandoc-preview--port nil)
 (defvar pandoc-preview--active-buffers nil)
 
 (defvar-local pandoc-preview--active nil)
@@ -147,13 +143,6 @@ Returns a list of lists, each inner list is (EXE ARG...)."
                       cmd))
             raw-commands)))
 
-(defun pandoc-preview--send (msg)
-  "Send MSG to Deno over the stored websocket connection."
-  (when pandoc-preview--ws
-    (condition-case nil
-        (websocket-send-text pandoc-preview--ws (json-encode msg))
-      (error nil))))
-
 (defun pandoc-preview--open-browser (url)
   (cond
    (pandoc-preview-browser-command
@@ -175,10 +164,10 @@ Returns a list of lists, each inner list is (EXE ARG...)."
                            (with-current-buffer buf
                              (when pandoc-preview--active
                                (setq pandoc-preview--syncing t)
-                               (pandoc-preview--send
-                                (list "sync"
-                                      (expand-file-name buffer-file-name)
-                                      (buffer-substring-no-properties (point-min) (point-max))))
+                               (deno-bridge-call
+                                "pandoc-preview" "sync"
+                                (expand-file-name buffer-file-name)
+                                (buffer-substring-no-properties (point-min) (point-max)))
                                (setq pandoc-preview--syncing nil)))))
                        (current-buffer)))))
 
@@ -190,6 +179,33 @@ Returns a list of lists, each inner list is (EXE ARG...)."
     (setq pandoc-preview--active-buffers (delq (current-buffer) pandoc-preview--active-buffers))
     (remove-hook 'after-change-functions #'pandoc-preview--sync t)
     (remove-hook 'kill-buffer-hook #'pandoc-preview--buffer-killed t)))
+
+(defun pandoc-preview--wait-for-connection (timeout)
+  "Wait up to TIMEOUT seconds for deno-bridge connection to be established."
+  (let ((client-sym (intern-soft "deno-bridge-client-pandoc-preview"))
+        (deadline (+ (float-time) timeout)))
+    (while (and (< (float-time) deadline)
+                (or (null client-sym)
+                    (null (symbol-value client-sym))
+                    (not (eq (websocket-ready-state (symbol-value client-sym)) 'open))))
+      (sleep-for 0.05)
+      (setq client-sym (intern-soft "deno-bridge-client-pandoc-preview")))
+    (when (or (null client-sym)
+              (null (symbol-value client-sym))
+              (not (eq (websocket-ready-state (symbol-value client-sym)) 'open)))
+      (error "[pandoc-preview] Deno bridge connection timeout"))))
+
+;;; Deno callback functions
+
+(defun pandoc-preview--on-server-ready (port)
+  "Called by Deno when HTTP server is ready on PORT."
+  (setq pandoc-preview--port port)
+  (pandoc-preview--open-browser
+   (format "http://%s:%s/" pandoc-preview-host port)))
+
+(defun pandoc-preview--on-render-error (message)
+  "Called by Deno when a render error occurs."
+  (message "[pandoc-preview] %s" message))
 
 ;;; Commands
 
@@ -205,8 +221,6 @@ Returns a list of lists, each inner list is (EXE ARG...)."
       (unless root (user-error "No project root"))
       (setq pandoc-preview--root (expand-file-name root))
       (let* ((ts (pandoc-preview--ts))
-             (port (+ 10000 (random 50000)))
-             (process-buffer " *pandoc-preview-deno*")
              (backend-plist (cdr backend-info))
              (in-file (file-name-nondirectory (buffer-file-name)))
              (commands (pandoc-preview--build-commands backend-plist in-file))
@@ -215,51 +229,42 @@ Returns a list of lists, each inner list is (EXE ARG...)."
              (file-abs (expand-file-name (buffer-file-name)))
              (backend-name (symbol-name (car backend-info))))
 
-        (setq pandoc-preview--server
-              (websocket-server
-               port
-               :host 'local
-               :on-message
-               (lambda (_ws frame)
-                 (when (eq (websocket-frame-opcode frame) 'text)
-                   (condition-case nil
-                       (let* ((info (json-parse-string (websocket-frame-text frame)))
-                              (msg-type (gethash "type" info)))
-                         (pcase msg-type
-                           ("server-ready"
-                            (let ((http-port (gethash "port" info)))
-                              (setq pandoc-preview--port http-port)
-                              (pandoc-preview--open-browser
-                               (format "http://%s:%s/" pandoc-preview-host http-port))))
-                           ("render-error"
-                            (message "[pandoc-preview] %s" (gethash "message" info "")))))
-                     (error nil))))
-               :on-open
-               (lambda (ws)
-                 (setq pandoc-preview--ws ws)
-                 (pandoc-preview--send (list "init" pandoc-preview--root file-abs backend-name))
-                 (pandoc-preview--send (list "render" commands watch-rx))
-                 (pandoc-preview--sync))
-               :on-close
-               (lambda (_ws)
-                 (setq pandoc-preview--ws nil)
-                 (message "[pandoc-preview] Deno disconnected"))))
+        (deno-bridge-start "pandoc-preview" ts)
 
-        (setq pandoc-preview--deno-process
-              (let ((process-environment (cons "NO_COLOR=true" process-environment)))
-                (start-process "pandoc-preview-deno" process-buffer
-                               "deno" "run" "--allow-all" ts
-                               "pandoc-preview" (format "%s" port))))
+        (pandoc-preview--wait-for-connection 5)
 
-        (set-process-sentinel pandoc-preview--deno-process
-                              (lambda (_proc event)
-                                (message "[pandoc-preview] Deno: %s" (string-trim event))))
+        (deno-bridge-call "pandoc-preview" "init"
+                          pandoc-preview--root file-abs backend-name)
+
+        (deno-bridge-call "pandoc-preview" "render"
+                          (json-encode commands) watch-rx)
 
         (setq pandoc-preview--active t)
         (add-hook 'after-change-functions #'pandoc-preview--sync nil t)
         (add-hook 'kill-buffer-hook #'pandoc-preview--buffer-killed nil t)
         (push (current-buffer) pandoc-preview--active-buffers)
         (message "[pandoc-preview] Started [%s]" (car backend-info))))))
+
+(defun pandoc-preview--cleanup-bridge ()
+  "Clean up deno-bridge resources for pandoc-preview."
+  (let* ((app-name "pandoc-preview")
+         (server (intern-soft (format "deno-bridge-server-%s" app-name)))
+         (process (intern-soft (format "deno-bridge-process-%s" app-name)))
+         (process-buffer (format " *deno-bridge-app-%s*" app-name))
+         (client (intern-soft (format "deno-bridge-client-%s" app-name))))
+    (when (and client (symbol-value client))
+      (ignore-errors (websocket-close (symbol-value client)))
+      (makunbound client))
+    (when (and server (symbol-value server))
+      (ignore-errors (websocket-server-close (symbol-value server)))
+      (makunbound server))
+    (when process
+      (let ((kill-buffer-query-functions nil))
+        (ignore-errors (kill-buffer process-buffer))
+        (when (symbol-value process)
+          (ignore-errors (delete-process (symbol-value process))))
+        (makunbound process)))
+    (setq deno-bridge-app-list (delete app-name deno-bridge-app-list))))
 
 ;;;###autoload
 (defun pandoc-preview-stop ()
@@ -272,17 +277,10 @@ Returns a list of lists, each inner list is (EXE ARG...)."
   (remove-hook 'kill-buffer-hook #'pandoc-preview--buffer-killed t)
   (setq pandoc-preview--active nil)
   (setq pandoc-preview--active-buffers (delq (current-buffer) pandoc-preview--active-buffers))
-  (when (and (null pandoc-preview--active-buffers) pandoc-preview--deno-process)
-    (pandoc-preview--send '("stop"))
+  (when (null pandoc-preview--active-buffers)
+    (deno-bridge-call "pandoc-preview" "stop")
     (sleep-for 0.3)
-    (ignore-errors (delete-process pandoc-preview--deno-process))
-    (let ((buf (get-buffer " *pandoc-preview-deno*")))
-      (when buf (kill-buffer buf)))
-    (when pandoc-preview--server
-      (websocket-server-close pandoc-preview--server)
-      (setq pandoc-preview--server nil))
-    (setq pandoc-preview--ws nil)
-    (setq pandoc-preview--deno-process nil)
+    (pandoc-preview--cleanup-bridge)
     (setq pandoc-preview--port nil))
   (message "[pandoc-preview] Stopped"))
 

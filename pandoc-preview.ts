@@ -1,11 +1,17 @@
 import { join, basename } from "https://deno.land/std/path/mod.ts"
 import { ensureDir, ensureSymlink } from "https://deno.land/std/fs/mod.ts"
+import { DenoBridge } from "https://deno.land/x/denobridge@0.0.1/mod.ts"
 
-const emacsPort = parseInt(Deno.args[1])
+const bridge = new DenoBridge(
+  Deno.args[0],
+  Deno.args[1],
+  Deno.args[2],
+  messageDispatcher,
+)
+
 const globalTmp = "/dev/shm"
 const sessionDir = join(globalTmp, `preview-${Deno.pid}`)
 
-let emacsWs: WebSocket | null = null
 let tempDir = ""
 let rootDir = ""
 let filePath = ""
@@ -16,51 +22,55 @@ let rendering = false
 let renderPending = false
 let renderVersion = 0
 let watcher: Deno.FsWatcher | null = null
+let httpServer: Deno.HttpServer | null = null
 
-function sendToEmacs(msg: Record<string, unknown>) {
-  if (emacsWs && emacsWs.readyState === WebSocket.OPEN) {
-    emacsWs.send(JSON.stringify(msg))
-  }
-}
-
-emacsWs = new WebSocket(`ws://127.0.0.1:${emacsPort}`)
-emacsWs.onerror = () => {}
-emacsWs.onclose = () => {}
-emacsWs.onmessage = (e) => {
-  if (typeof e.data === "string") handleMessage(e.data)
-}
-
-async function handleMessage(data: string) {
+async function messageDispatcher(message: string) {
   try {
-    const [cmd, ...args] = JSON.parse(data)
+    const parsed = JSON.parse(message)
+    const [cmd, ...args] = parsed[1] as [string, ...unknown[]]
     switch (cmd) {
       case "init": {
-        rootDir = args[0]
-        filePath = args[1]
+        rootDir = args[0] as string
+        filePath = args[1] as string
         const hash = Array.from(
-          new Uint8Array(await crypto.subtle.digest("SHA-1", new TextEncoder().encode(rootDir)))
-        ).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 12)
+          new Uint8Array(
+            await crypto.subtle.digest(
+              "SHA-1",
+              new TextEncoder().encode(rootDir),
+            ),
+          ),
+        )
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("")
+          .slice(0, 12)
         tempDir = join(sessionDir, hash)
         await ensureDir(tempDir)
         for await (const entry of Deno.readDir(rootDir)) {
           if (entry.name.startsWith(".")) continue
-          try { await ensureSymlink(join(rootDir, entry.name), join(tempDir, entry.name)) } catch {}
+          try {
+            await ensureSymlink(join(rootDir, entry.name), join(tempDir, entry.name))
+          } catch {}
         }
         break
       }
       case "render": {
-        renderArgs = args[0]
-        watchRx = new RegExp(args[1])
+        renderArgs = JSON.parse(args[0] as string) as string[][]
+        watchRx = new RegExp(args[1] as string)
         await doRender()
         startWatcher()
-        const server = Deno.serve({ port: 0, hostname: "127.0.0.1" }, httpHandler)
-        sendToEmacs({ type: "server-ready", port: server.addr.port })
+        httpServer = Deno.serve({ port: 0, hostname: "127.0.0.1" }, httpHandler)
+        const addr = httpServer.addr as Deno.NetAddr
+        bridge.evalInEmacs(
+          `(pandoc-preview--on-server-ready ${addr.port})`,
+        )
         break
       }
       case "sync": {
-        const name = basename(args[0])
-        try { await Deno.remove(join(tempDir, name)) } catch {}
-        await Deno.writeTextFile(join(tempDir, name), args[1])
+        const name = basename(args[0] as string)
+        try {
+          await Deno.remove(join(tempDir, name))
+        } catch {}
+        await Deno.writeTextFile(join(tempDir, name), args[1] as string)
         scheduleRender()
         break
       }
@@ -69,21 +79,50 @@ async function handleMessage(data: string) {
         break
       }
     }
-  } catch {}
+  } catch (e) {
+    console.error("[pandoc-preview] error:", e)
+  }
 }
 
 async function cleanup() {
-  if (watcher) { watcher.close(); watcher = null }
-  try { await Deno.remove(sessionDir, { recursive: true }) } catch {}
+  if (watcher) {
+    watcher.close()
+    watcher = null
+  }
+  if (httpServer) {
+    await httpServer.shutdown()
+    httpServer = null
+  }
+  try {
+    await Deno.remove(sessionDir, { recursive: true })
+  } catch {}
 }
 
-try { Deno.addSignalListener("SIGINT", async () => { await cleanup(); Deno.exit(0) }) } catch {}
-try { Deno.addSignalListener("SIGTERM", async () => { await cleanup(); Deno.exit(0) }) } catch {}
-try { Deno.addSignalListener("SIGHUP", async () => { await cleanup(); Deno.exit(0) }) } catch {}
+try {
+  Deno.addSignalListener("SIGINT", async () => {
+    await cleanup()
+    Deno.exit(0)
+  })
+} catch {}
+try {
+  Deno.addSignalListener("SIGTERM", async () => {
+    await cleanup()
+    Deno.exit(0)
+  })
+} catch {}
+try {
+  Deno.addSignalListener("SIGHUP", async () => {
+    await cleanup()
+    Deno.exit(0)
+  })
+} catch {}
 
 async function runCmd(exe: string, args: string[], cwd: string) {
   const { success, stderr } = await new Deno.Command(exe, {
-    args, cwd, stdout: "piped", stderr: "piped"
+    args,
+    cwd,
+    stdout: "piped",
+    stderr: "piped",
   }).output()
   return { success, stderr: new TextDecoder().decode(stderr).trim() }
 }
@@ -97,7 +136,9 @@ async function doRender() {
       if (!Array.isArray(args) || args.length === 0) continue
       const { success, stderr } = await runCmd(args[0], args.slice(1), tempDir)
       if (!success) {
-        sendToEmacs({ type: "render-error", message: stderr.split("\n").pop() || stderr })
+        bridge.evalInEmacs(
+          `(pandoc-preview--on-render-error ${JSON.stringify(stderr.split("\n").pop() || stderr)})`,
+        )
         rendering = false
         return
       }
@@ -125,13 +166,15 @@ function startWatcher() {
     ;(async () => {
       for await (const event of watcher!) {
         if (event.kind === "modify" || event.kind === "create") {
-          if (event.paths.some(p => rx.test(p) && !p.includes("/."))) {
+          if (event.paths.some((p) => rx.test(p) && !p.includes("/."))) {
             for (const p of event.paths) {
               if (rx.test(p) && !p.includes("/.")) {
                 try {
                   const content = await Deno.readTextFile(p)
                   const target = join(tempDir, basename(p))
-                  try { await Deno.remove(target) } catch {}
+                  try {
+                    await Deno.remove(target)
+                  } catch {}
                   await Deno.writeTextFile(target, content)
                 } catch {}
               }
@@ -148,18 +191,35 @@ const RELOAD = `<script>(function(){var v=0;function c(){fetch("/__pv?="+Date.no
 
 async function httpHandler(req: Request): Promise<Response> {
   const path = new URL(req.url).pathname
-  if (path === "/__pv") return new Response(String(renderVersion), { headers: { "Cache-Control": "no-cache" } })
+  if (path === "/__pv")
+    return new Response(String(renderVersion), {
+      headers: { "Cache-Control": "no-cache" },
+    })
   const base = basename(filePath).replace(/\.\w+$/, "")
-  const cands = path === "/" ? [base + ".html", base, "index.html"] : [path, path + ".html", path.slice(0, -5)]
+  const cands =
+    path === "/"
+      ? [base + ".html", base, "index.html"]
+      : [path, path + ".html", path.slice(0, -5)]
   for (const c of cands) {
     try {
       let content = await Deno.readTextFile(join(tempDir, c))
       if (c.endsWith(".html") || !c.includes(".")) {
-        content = content.replace(/<\/?root>/g, "").replace("</head>", RELOAD + "</head>")
+        content = content
+          .replace(/<\/?root>/g, "")
+          .replace("</head>", RELOAD + "</head>")
       }
       const ext = (c.split(".").pop() || "").toLowerCase()
-      const ct: Record<string, string> = { html: "text/html", css: "text/css", js: "text/javascript", png: "image/png", jpg: "image/jpeg", svg: "image/svg+xml" }
-      return new Response(content, { headers: { "Content-Type": ct[ext] || "text/html; charset=utf-8" } })
+      const ct: Record<string, string> = {
+        html: "text/html",
+        css: "text/css",
+        js: "text/javascript",
+        png: "image/png",
+        jpg: "image/jpeg",
+        svg: "image/svg+xml",
+      }
+      return new Response(content, {
+        headers: { "Content-Type": ct[ext] || "text/html; charset=utf-8" },
+      })
     } catch {}
   }
   return new Response("Not found", { status: 404 })
